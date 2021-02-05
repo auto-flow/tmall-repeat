@@ -4,8 +4,6 @@ __pycache__
 *.csv
 venv
 *.json
-*.pdf
-*.png
 *.pkl
 .pytest_cache
 *.log
