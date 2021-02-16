@@ -19,7 +19,7 @@ from pyspark.sql.types import FloatType, DoubleType
 from pyspark.sql.types import StructType, StructField
 from pyspark.sql.types import TimestampType
 
-from fesys_pyspark import FeaturesBuilder
+from stat_feat.fesys_pyspark import FeaturesBuilder
 
 
 def get_schema_from_df(df: pd.DataFrame):
