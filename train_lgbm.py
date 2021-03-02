@@ -10,7 +10,7 @@ import pandas as pd
 from joblib import load
 from lightgbm import LGBMClassifier
 
-from bagging import BalancedBaggingClassifier
+from tmall.bagging import BalancedBaggingClassifier
 
 train, y, test = load('data/all_data.pkl')
 # merchant_w2v: pd.DataFrame = load('data/merchant_w2v.pkl')

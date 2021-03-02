@@ -25,6 +25,7 @@ def get_dummies(df, columns, prefix=None):
             df = df.withColumn(col_name, F.when(df[column] == dst, 1).otherwise(0))
     return df
 
+
 # 尽量能和pandas的规则对应上
 window_func = {
     "max": F.max,
@@ -37,7 +38,7 @@ window_func = {
     "std": F.stddev,
 }
 
-from utils import reduce_mem_usage
+from tmall.utils import reduce_mem_usage, spark_to_pandas
 
 warnings.filterwarnings("ignore")
 
@@ -57,8 +58,12 @@ class FeaturesBuilder():
         res += len(self.op_feats)
         return res
 
+    def convert_to_pandas(self):
+        for pk, df in self.pk2df.items():
+            self.pk2df[pk] = df if isinstance(df, pd.DataFrame) else spark_to_pandas(df, 12)
+
     def reduce_mem_usage(self):
-        # todo
+        self.convert_to_pandas()
         for pk in self.pk2df:
             self.pk2df[pk] = reduce_mem_usage(self.pk2df[pk])
 
@@ -125,12 +130,15 @@ class FeaturesBuilder():
                 # 将除0产生的nan替换为0
                 df_agg = df_agg.fillna(0)
                 self.pk2df[t_pk] = self.pk2df[t_pk].join(df_agg, how='left', on=primaryKey)
-            # if multi_out_agg_funcs:
-            #     for names, func in multi_out_agg_funcs:
-            #         df_mo_agg = self.core_df.groupby(primaryKey).agg({countValue: func}).reset_index()
-            #         for i, name in enumerate(names):
-            #             df_mo_agg[f"{pk_val_col}-{name}"] = df_mo_agg[countValue].apply(lambda x: x[i])
-            #         df_mo_agg.pop(countValue)
+            # 对频率分布进行统计
+            if multi_out_agg_funcs:
+                for names, func in multi_out_agg_funcs:
+                    df_mo_agg = self.core_df.groupby(primaryKey).agg(
+                        func(F.collect_list(countValue)).alias("multi_output"))
+                    for i, name in enumerate(names):
+                        df_mo_agg = df_mo_agg.withColumn(f"{pk_val_col}-{name}", df_mo_agg['multi_output'][i])
+                    df_mo_agg = df_mo_agg.drop('multi_output')
+                    self.pk2df[t_pk] = self.pk2df[t_pk].join(df_mo_agg, how='left', on=primaryKey)
             dummy_columns = []
             if dummy:
                 # todo
@@ -148,7 +156,7 @@ class FeaturesBuilder():
                 pk_cnt_df_dummy = pk_cnt_df_dummy.drop(pk_val_col)
                 columns = pk_cnt_df_dummy.columns
                 pk_cnt_df_dummy = pk_cnt_df_dummy.groupby(primaryKey).sum()
-                for pk in primaryKey: # 删掉原主键（新增了sum(pk)），呆的一笔
+                for pk in primaryKey:  # 删掉原主键（新增了sum(pk)），呆的一笔
                     pk_cnt_df_dummy = pk_cnt_df_dummy.drop(pk)
                 cur_cols = pk_cnt_df_dummy.columns
                 # todo:  更好的重命名方法

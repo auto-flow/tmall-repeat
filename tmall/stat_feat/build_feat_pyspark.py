@@ -14,12 +14,13 @@ from pyspark.sql import SQLContext
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import udf
 # spark 变量类型：https://spark.apache.org/docs/latest/sql-ref-datatypes.html
-from pyspark.sql.types import ByteType, ShortType, IntegerType, LongType
+from pyspark.sql.types import ByteType, ShortType, IntegerType, LongType, ArrayType
 from pyspark.sql.types import FloatType, DoubleType
 from pyspark.sql.types import StructType, StructField
 from pyspark.sql.types import TimestampType
 
-from stat_feat.fesys_pyspark import FeaturesBuilder
+from tmall.stat_feat.fesys_pyspark import FeaturesBuilder
+from tmall.utils import get_data_path
 
 
 def get_schema_from_df(df: pd.DataFrame):
@@ -42,10 +43,10 @@ def get_schema_from_df(df: pd.DataFrame):
 
 
 # from fesys2 import FeaturesBuilder
-
+data_path = get_data_path()
 warnings.filterwarnings("ignore")
 
-user_log = pd.read_pickle('data/user_log.pkl')
+user_log = pd.read_pickle(f'{data_path}/user_log.pkl')
 user_log['label'] = user_log['label'].astype('int8')  # 之前的操作忘了这步
 
 spark = SparkSession.builder \
@@ -57,8 +58,9 @@ sc = spark.sparkContext
 sqlContest = SQLContext(sc)
 print('loading data to spark dataframe ...')
 schema = get_schema_from_df(user_log)
-user_log = sqlContest.createDataFrame(user_log.iloc[:10000, :], schema=schema)  # 采样
-# user_log = sqlContest.createDataFrame(user_log, schema=schema)
+# user_log = sqlContest.createDataFrame(user_log.iloc[:10000, :], schema=schema)  # 采样
+user_log = sqlContest.createDataFrame(user_log, schema=schema)  # fixme
+user_log.repartition(12)  # 切片
 gc.collect()
 print('done')
 
@@ -76,13 +78,16 @@ def freq_stat_info(seq):
     cnt = Counter(seq)
     size = len(seq)
     freq = [v / size for v in cnt.values()]
-    return np.min(freq), np.mean(freq), np.max(freq), np.std(freq)
+    return [float(i) for i in (np.min(freq), np.mean(freq), np.max(freq), np.std(freq))]
 
 
+freq_stat_info_udf = udf(freq_stat_info, ArrayType(FloatType()))
 freq_stat_info_names = ["freq_min", "freq_mean", "freq_max", "freq_std"]
-# rebuy_ranges = list(range(1, 11, 1))
-rebuy_ranges = list(range(1, 2, 1))
-
+rebuy_ranges = list(range(1, 11, 1)) # fixme
+# rebuy_ranges = list(range(1, 2, 1))
+rebuy_udf1 = udf(lambda x: sum([cnt for cnt in Counter(x).values() if cnt > 1]),
+                 IntegerType())
+rebuy_udf1.__name__ = f"rebuy{1}"
 merchant_item_ids = ['merchant_id', 'item_id', 'brand_id', 'cat_id']
 item_ids = ['item_id', 'brand_id', 'cat_id']
 user_feats = ['age_range', 'gender']
@@ -94,12 +99,74 @@ indicator2action_type = {
     'purchase': 2,
     'favorite': 3,
 }
-for indicator in ["purchase", None]:
+
+
+# 统计双11 3天时间内的一些重要特征 (记录数占24%)
+d11_user_log = user_log.filter(user_log['time_stamp_int'].isin([1110, 1111, 1112]))
+feat_builder.core_df = d11_user_log
+core_df = d11_user_log
+for indicator in ["purchase", None]: # fixme
+# for indicator in ["purchase"]:
+    # where action_type = 'purchase'
     if indicator is not None:
         action_type = indicator2action_type[indicator]
         feat_builder.core_df = user_log.filter(user_log['action_type'] == action_type)
     else:
         feat_builder.core_df = user_log
+    # 改indicator名
+    if indicator is None:
+        indicator = "d11"
+    else:
+        indicator = f"d11-{indicator}"
+    # 预判前缀
+    prefix = f"{indicator}-"
+    print('以【用户，商铺，【用户 商铺】】为主键，对【items】等算nunique计数')
+    for pk in core_ids:
+        target = [id_ for id_ in core_ids + item_ids if id_ != pk]
+        feat_builder.buildCountFeatures(
+            pk, target, dummy=False,
+            agg_funcs=['nunique'],
+            prefix=indicator)
+    feat_builder.buildCountFeatures(core_ids, item_ids, dummy=False, agg_funcs=['nunique'], prefix=indicator)
+    print('用户，商铺，用户商铺的行为比例')
+    if indicator == "d11":
+        for pk in core_ids + [core_ids]:
+            feat_builder.buildCountFeatures(pk, 'action_type', prefix=indicator)  # , agg_funcs=[unique_udf] 感觉没必要
+    print('双11期间的复购 (不计算多重复购的统计信息了)')
+    if indicator != "d11":
+        feat_builder.buildCountFeatures('user_id', 'merchant_id', dummy=False,
+                                        agg_funcs=[rebuy_udf1], prefix=indicator)
+        feat_builder.buildCountFeatures('merchant_id', 'user_id', dummy=False,
+                                        agg_funcs=[rebuy_udf1], prefix=indicator)
+        feat_builder.addOperateFeatures(f'{prefix}user_rebuy_ratio',
+                                        f"lambda x: x['{prefix}user_id-merchant_id-rebuy'] / x['{prefix}user_id-cnt']")
+        feat_builder.addOperateFeatures(f'{prefix}merchant_rebuy_ratio',
+                                        f"lambda x: x['{prefix}merchant_id-user_id-rebuy'] / x['{prefix}merchant_id-cnt']")
+    print('双11期间的用户、商铺比例特征')
+    feat_builder.addOperateFeatures(f'{prefix}users_div_merchants',
+                                    f"lambda x: x['{prefix}user_id-cnt'] / x['{prefix}merchant_id-cnt']")
+    feat_builder.addOperateFeatures(f'{prefix}merchants_div_users',
+                                    f"lambda x: x['{prefix}user_id-cnt'] / x['{prefix}merchant_id-cnt']")
+
+for indicator in ["purchase", None]: # fixme
+# for indicator in ["purchase"]:
+    if indicator is not None:
+        action_type = indicator2action_type[indicator]
+        feat_builder.core_df = user_log.filter(user_log['action_type'] == action_type)
+    else:
+        feat_builder.core_df = user_log
+    # =============================================
+    print('对频率分布的统计特征')
+    for pk in core_ids:
+        target = [id_ for id_ in core_ids + item_ids if id_ != pk]
+        feat_builder.buildCountFeatures(
+            pk, target, dummy=False,
+            multi_out_agg_funcs=[(freq_stat_info_names, freq_stat_info_udf)],
+            prefix=indicator)
+    feat_builder.buildCountFeatures(
+        core_ids, item_ids, dummy=False,
+        multi_out_agg_funcs=[(freq_stat_info_names, freq_stat_info_udf)],
+        prefix=indicator)
     # ==============================================
     print('计算用户和商铺的复购次数（复购率用UDF算）')
     if indicator is not None:
@@ -121,18 +188,6 @@ for indicator in ["purchase", None]:
     for pk in core_ids + [core_ids]:
         feat_builder.buildCountFeatures(pk, "time_stamp_int", dummy=False, agg_funcs=["min", "max"],
                                         prefix=indicator)
-    # =============================================
-    print('对频率分布的统计特征')
-    for pk in core_ids:
-        target = [id_ for id_ in core_ids + item_ids if id_ != pk]
-        feat_builder.buildCountFeatures(
-            pk, target, dummy=False,
-            multi_out_agg_funcs=[(freq_stat_info_names, freq_stat_info)],
-            prefix=indicator)
-    feat_builder.buildCountFeatures(
-        core_ids, item_ids, dummy=False,
-        multi_out_agg_funcs=[(freq_stat_info_names, freq_stat_info)],
-        prefix=indicator)
     # =============================================
     print('【商家，商品，品牌，类别】与多少【用户】交互过（去重）')
     for pk in merchant_item_ids:
@@ -179,8 +234,10 @@ for indicator in ["purchase", None]:
                                             f"lambda x: x['{prefix}merchant_id-user_id-rebuy{rebuy_times}'] / x['{prefix}merchant_id-cnt']")
     print('finish', indicator)
 
+
+
 feat_builder.reduce_mem_usage()
 del feat_builder.core_df
-dump(feat_builder, "data/feat_builder.pkl")
+dump(feat_builder, f"{data_path}/feat_builder.pkl")
 # 打印出来的总特征数不准，因为有些主键对应的表用不上
 print("总特征数：", feat_builder.n_features)
